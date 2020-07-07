@@ -1,0 +1,120 @@
+---
+title: "Dissertation P1"
+author: "Wenyi Fang"
+date: "6/14/2020"
+output: pdf_document
+---
+
+##read datas and library packages
+```{r }
+setwd("/Users/vanessafung/Desktop")
+mutations = read.delim(file = "/Users/vanessafung/Desktop/genie_data_mutations_extended.txt",header = T)
+
+library("reticulate")
+
+source_python("read_pickle.py")
+pickle_data <- read_pickle_file("codon_mutability.pickle")
+
+extra.dt = read.delim(file = "/Users/vanessafung/Desktop/pre_tcga_mutations_data.txt",header = T)
+
+library(tidyverse)
+library(tibble)
+library(dplyr)
+library(tidyr)
+library(magrittr)
+library(purrr)
+```
+
+##calculate mutation frequency/probability
+```{r}
+#tidy the dataframe to get a sufficient and simple version
+view_mutation = mutations%>%
+  select(Tumor_Sample_Barcode,Hugo_Symbol,NCBI_Build,Chromosome,HGVSp_Short,Start_Position,End_Position,Variant_Classification,Variant_Type)%>%
+  filter(Variant_Classification == "Missense_Mutation"&Variant_Type == "SNP")
+tbl_mutation = mutations%>%
+  select(Tumor_Sample_Barcode,Hugo_Symbol,NCBI_Build,Chromosome,HGVSp_Short,Start_Position,End_Position,Variant_Classification,Variant_Type)%>%
+  filter(Variant_Classification == "Missense_Mutation"&Variant_Type == "SNP")%>%
+  separate(HGVSp_Short,
+           into = c("p.","text"),
+           sep = "(p.)"
+           )%$%
+  .[,-5]%>%
+  separate(text, 
+           into = c("allele1","num","allele2"),
+           sep = "(?=[A-Za-z])(?<=[0-9])|(?=[0-9])(?<=[A-Za-z])"
+           )%>%
+  mutate(HGVS = paste(allele1,num,sep = ""))%>%
+  mutate(codon = paste(Hugo_Symbol,HGVS,sep = "_"))%$%
+  .[,-(5:7)]%>%
+  distinct(Tumor_Sample_Barcode,codon)
+           
+#count mutation for each codon in genefile  
+tbl_mutation_freq = tbl_mutation%>%
+  group_by(codon)%>%
+  count()%>%
+  arrange(desc(n))
+
+patient_number = length(levels(tbl_mutation$Tumor_Sample_Barcode))
+tbl_mutation_freq = tbl_mutation_freq%>%
+  mutate(probability = n/patient_number)
+
+head(view_mutation,5)
+```
+
+
+##do binomial test for each codon
+```{r}
+#calculate p in binom.test.pvalue
+tbl_mutation_freq_omit = tbl_mutation_freq[which(names(pickle_data)%in%tbl_mutation_freq$codon),] 
+tbl_mutation_freq_omit$expected.prob = unlist(pickle_data[match(tbl_mutation_freq$codon, names(pickle_data), nomatch = NA)], use.names = F)
+
+#prepare a binomial test function for apply
+binom.test.pvalue = function(x,p){
+  result = binom.test(x, patient_number, p, alternative = "greater")
+  return(result$p.value)
+}
+binom.test.pvalue(tbl_mutation_freq_omit$n[1],tbl_mutation_freq_omit$expected.prob[1])#trial
+
+#binomial test
+tbl_mutation_freq_omit$test.pvalue = mapply(
+  binom.test.pvalue,
+  tbl_mutation_freq_omit$n,
+  tbl_mutation_freq_omit$expected.prob
+)
+
+```
+
+
+##multiple correction
+```{r}
+benjamini.hochberg  =  function(results.dt, q){
+  parg.results = arrange(results.dt,test.pvalue)
+  k = 0
+  while (parg.results$test.pvalue[k+1]<=(k+1)*q/length(parg.results$test.pvalue)){
+    k = k+1
+  }
+  print(k)
+  return(parg.results[c(1:k),])
+}
+
+origin_codonlist = tbl_mutation_freq_omit[which(tbl_mutation_freq_omit$test.pvalue<=0.01),]
+
+codon_list = benjamini.hochberg(tbl_mutation_freq_omit,0.01)
+
+tbl_mutation_freq_omit$BH.adjust = p.adjust(tbl_mutation_freq_omit$test.pvalue,method = "BH")
+codon_list_BH = tbl_mutation_freq_omit[which(tbl_mutation_freq_omit$BH.adjust<=0.01),]
+
+tbl_mutation_freq_omit$BY.adjust = p.adjust(tbl_mutation_freq_omit$test.pvalue,method = "BY")
+codon_list_BY = tbl_mutation_freq_omit[which(tbl_mutation_freq_omit$BY.adjust<=0.01),]
+
+codon_list_BH$threshold.BH = (seq(1,length(codon_list_BH$codon),1)*0.01)/length(codon_list_BH$codon)
+head(codon_list_BH[,-7],5)
+```
+
+```{r}
+library(ggplot2)
+#graph
+exp.probability.histagram = ggplot(tbl_mutation_freq_omit[which(tbl_mutation_freq_omit$expected.prob <=0.00005), ], aes(x = expected.prob)) + 
+  geom_histogram()
+exp.probability.histagram
+```
